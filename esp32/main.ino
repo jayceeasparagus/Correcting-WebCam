@@ -1,101 +1,52 @@
-#include <WiFi.h>
+/*
+ * ESP32-S3 Nano UART-only test for talking to the STM32.
+ *
+ * Open the ESP32 Serial Monitor at 115200 baud, set line ending to Newline,
+ * and type:
+ *   PING
+ *   LED_ON
+ *   LED_OFF
+ *   BLINK
+ *
+ * The ESP32 forwards each line to the STM32 and prints the STM32 reply.
+ */
 
-const char* WIFI_SSID = "JRS";
-const char* WIFI_PASSWORD = "0324010324";
+#include <Arduino.h>
 
-const uint16_t TCP_PORT = 5000;
-const uint32_t USB_BAUD = 115200;
-const uint32_t STM32_BAUD = 115200;
+static constexpr uint32_t USB_BAUD = 115200;
+static constexpr uint32_t STM32_BAUD = 115200;
 
-const int STM32_RX_PIN = D0;  // ESP32-S3 Nano RX: connect to STM32 TX
-const int STM32_TX_PIN = D1;  // ESP32-S3 Nano TX: connect to STM32 RX
+// Arduino Nano ESP32 / ESP32-S3 Nano labeled pins.
+// D0 is this board's UART RX pin, D1 is this board's UART TX pin.
+static constexpr int STM32_UART_RX_PIN = D0;  // Connect to STM32 USART1_TX / PA9
+static constexpr int STM32_UART_TX_PIN = D1;  // Connect to STM32 USART1_RX / PA10
 
-WiFiServer server(TCP_PORT);
-WiFiClient client;
+static String usbLine;
+static String stm32Line;
 
-String usbLine;
-String stm32Line;
+static void readUsbSerial();
+static void readStm32Serial();
+static void sendToStm32(const String& command);
 
-void connectToWiFi();
-void acceptTcpClient();
-void readTcpCommand();
-void readUsbCommand();
-void readStm32Response();
-void sendCommandToStm32(const String& command);
-void publishStm32Response(const String& response);
-
-void setup() {
+void setup()
+{
   Serial.begin(USB_BAUD);
-  Serial1.begin(STM32_BAUD, SERIAL_8N1, STM32_RX_PIN, STM32_TX_PIN);
-  delay(2000);
+  Serial1.begin(STM32_BAUD, SERIAL_8N1, STM32_UART_RX_PIN, STM32_UART_TX_PIN);
 
+  delay(1000);
   Serial.println();
-  Serial.println("ESP32-S3 Nano bridge starting.");
-  Serial.print("STM32 UART RX pin: D0, TX pin: D1, baud: ");
-  Serial.println(STM32_BAUD);
-
-  connectToWiFi();
-  server.begin();
-
-  Serial.print("TCP server listening on port ");
-  Serial.println(TCP_PORT);
-  Serial.println("You can also type PING/PAN_LEFT/STOP in this Serial Monitor.");
+  Serial.println("ESP32-S3 Nano UART-only test ready.");
+  Serial.println("Type PING, LED_ON, LED_OFF, or BLINK.");
 }
 
-void loop() {
-  acceptTcpClient();
-  readTcpCommand();
-  readUsbCommand();
-  readStm32Response();
+void loop()
+{
+  readUsbSerial();
+  readStm32Serial();
 }
 
-void connectToWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  Serial.print("Connecting to Wi-Fi");
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println();
-  Serial.println("Connected!");
-  Serial.print("ESP32 IP: ");
-  Serial.println(WiFi.localIP());
-}
-
-void acceptTcpClient() {
-  if (client && client.connected()) {
-    return;
-  }
-
-  WiFiClient newClient = server.available();
-
-  if (newClient) {
-    client = newClient;
-    Serial.println("Laptop connected.");
-    client.println("{\"status\":\"connected\"}");
-  }
-}
-
-void readTcpCommand() {
-  if (!client || !client.connected() || !client.available()) {
-    return;
-  }
-
-  String message = client.readStringUntil('\n');
-  message.trim();
-
-  if (message.length() > 0) {
-    Serial.print("PC -> ESP32: ");
-    Serial.println(message);
-    sendCommandToStm32(message);
-  }
-}
-
-void readUsbCommand() {
+static void readUsbSerial()
+{
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
 
@@ -107,19 +58,19 @@ void readUsbCommand() {
       usbLine.trim();
 
       if (usbLine.length() > 0) {
-        Serial.print("USB -> ESP32: ");
-        Serial.println(usbLine);
-        sendCommandToStm32(usbLine);
+        sendToStm32(usbLine);
       }
 
       usbLine = "";
-    } else {
-      usbLine += c;
+      continue;
     }
+
+    usbLine += c;
   }
 }
 
-void readStm32Response() {
+static void readStm32Serial()
+{
   while (Serial1.available() > 0) {
     char c = (char)Serial1.read();
 
@@ -131,31 +82,23 @@ void readStm32Response() {
       stm32Line.trim();
 
       if (stm32Line.length() > 0) {
-        publishStm32Response(stm32Line);
+        Serial.print("STM32 -> ESP32: ");
+        Serial.println(stm32Line);
       }
 
       stm32Line = "";
-    } else {
-      stm32Line += c;
+      continue;
     }
+
+    stm32Line += c;
   }
 }
 
-void sendCommandToStm32(const String& command) {
+static void sendToStm32(const String& command)
+{
   Serial.print("ESP32 -> STM32: ");
   Serial.println(command);
 
   Serial1.print(command);
   Serial1.print('\n');
-}
-
-void publishStm32Response(const String& response) {
-  Serial.print("STM32 -> ESP32: ");
-  Serial.println(response);
-
-  if (client && client.connected()) {
-    client.print("{\"stm32\":\"");
-    client.print(response);
-    client.println("\"}");
-  }
 }
