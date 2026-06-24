@@ -1,0 +1,11 @@
+../Core/Src/main.c:78:5:main	4
+../Core/Src/main.c:146:6:SystemClock_Config	3
+../Core/Src/main.c:193:13:MX_USART2_UART_Init	2
+../Core/Src/main.c:226:13:MX_GPIO_Init	1
+../Core/Src/main.c:261:13:MX_TIM3_Init	7
+../Core/Src/main.c:311:13:Servo_SetPulse	6
+../Core/Src/main.c:325:13:UART_PollCommand	6
+../Core/Src/main.c:358:13:UART_ProcessCommand	7
+../Core/Src/main.c:396:13:UART_SendText	1
+../Core/Src/main.c:401:13:BlinkStatus	2
+../Core/Src/main.c:420:6:Error_Handler	1
