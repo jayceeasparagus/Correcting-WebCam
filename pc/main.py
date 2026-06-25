@@ -1,6 +1,7 @@
 import json
 import socket
 import time
+import argparse
 
 import cv2
 
@@ -36,6 +37,7 @@ class ESP32Client:
                 (self.host, self.port),
                 timeout=0.5,
             )
+            self.socket.settimeout(0.01)
 
             print(f"Connected to ESP32 at {self.host}:{self.port}")
             return True
@@ -52,6 +54,7 @@ class ESP32Client:
 
         try:
             self.socket.sendall(message.encode("utf-8"))
+            self.read_available_responses()
             return True
 
         except OSError:
@@ -63,6 +66,22 @@ class ESP32Client:
         if self.socket is not None:
             self.socket.close()
             self.socket = None
+
+    def read_available_responses(self):
+        if self.socket is None:
+            return
+
+        try:
+            data = self.socket.recv(1024)
+        except socket.timeout:
+            return
+        except OSError:
+            self.close()
+            return
+
+        if data:
+            for line in data.decode("utf-8", errors="replace").splitlines():
+                print(f"ESP32: {line}")
 
 
 def get_face_area(face):
@@ -90,8 +109,34 @@ def get_tilt_command(error_y):
     return "STOP"
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="OpenCV webcam tracker that sends pan/tilt commands to ESP32."
+    )
+    parser.add_argument(
+        "--esp32-ip",
+        default=ESP32_IP,
+        help="ESP32 IP address printed in the ESP32 Serial Monitor.",
+    )
+    parser.add_argument(
+        "--esp32-port",
+        type=int,
+        default=ESP32_PORT,
+        help="ESP32 TCP server port.",
+    )
+    parser.add_argument(
+        "--camera",
+        type=int,
+        default=0,
+        help="OpenCV camera index.",
+    )
+    return parser.parse_args()
+
+
 def main():
-    camera = cv2.VideoCapture(0)
+    args = parse_args()
+
+    camera = cv2.VideoCapture(args.camera)
 
     face_cascade = cv2.CascadeClassifier(
         cv2.data.haarcascades
@@ -108,7 +153,7 @@ def main():
         camera.release()
         return
 
-    esp32 = ESP32Client(ESP32_IP, ESP32_PORT)
+    esp32 = ESP32Client(args.esp32_ip, args.esp32_port)
 
     print("Camera opened. Face detection is running.")
     print("Press q in the video window to quit.")
@@ -310,7 +355,14 @@ def main():
                 "error_y": command_error_y,
             }
 
-            esp32.send_command(command)
+            command_sent = esp32.send_command(command)
+
+            if command_sent:
+                print(
+                    f"Sent seq={sequence_number} "
+                    f"pan={pan_command} tilt={tilt_command} "
+                    f"error_x={command_error_x} error_y={command_error_y}"
+                )
 
             sequence_number += 1
             last_command_time = current_time

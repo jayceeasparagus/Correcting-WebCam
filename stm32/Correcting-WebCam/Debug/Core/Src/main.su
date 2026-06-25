@@ -4,6 +4,6 @@
 ../Core/Src/main.c:106:13:MX_USART1_UART_Init	8	static
 ../Core/Src/main.c:122:13:UART_PollCommand	16	static
 ../Core/Src/main.c:154:13:UART_ProcessCommand	16	static
-../Core/Src/main.c:182:13:UART_SendText	16	static
-../Core/Src/main.c:187:13:BlinkStatus	24	static
-../Core/Src/main.c:198:6:Error_Handler	4	static,ignoring_inline_asm
+../Core/Src/main.c:197:13:UART_SendText	16	static
+../Core/Src/main.c:202:13:BlinkStatus	24	static
+../Core/Src/main.c:213:6:Error_Handler	4	static,ignoring_inline_asm

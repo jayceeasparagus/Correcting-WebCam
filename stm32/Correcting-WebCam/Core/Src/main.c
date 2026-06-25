@@ -14,7 +14,7 @@
 /* USER CODE END Includes */
 
 /* USER CODE BEGIN PD */
-#define UART_RX_LINE_MAX 32U
+#define UART_RX_LINE_MAX 64U
 /* USER CODE END PD */
 
 UART_HandleTypeDef huart1;
@@ -43,7 +43,7 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
 
-  UART_SendText("\r\nSTM32 UART-only test ready. Commands: PING, LED_ON, LED_OFF, BLINK\r\n");
+  UART_SendText("\r\nSTM32 command receiver ready.\r\n");
 
   while (1)
   {
@@ -172,6 +172,21 @@ static void UART_ProcessCommand(const char *command)
   {
     UART_SendText("OK BLINK\r\n");
     BlinkStatus(3U);
+  }
+  else if (strncmp(command, "PAN=", 4) == 0)
+  {
+    if (strstr(command, "PAN=STOP") && strstr(command, "TILT=STOP"))
+    {
+      HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+    }
+    else
+    {
+      HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+    }
+
+    UART_SendText("OK ");
+    UART_SendText(command);
+    UART_SendText("\r\n");
   }
   else
   {

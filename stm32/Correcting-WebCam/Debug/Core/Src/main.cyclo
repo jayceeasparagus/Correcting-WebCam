@@ -3,7 +3,7 @@
 ../Core/Src/main.c:89:13:MX_GPIO_Init	1
 ../Core/Src/main.c:106:13:MX_USART1_UART_Init	2
 ../Core/Src/main.c:122:13:UART_PollCommand	6
-../Core/Src/main.c:154:13:UART_ProcessCommand	5
-../Core/Src/main.c:182:13:UART_SendText	1
-../Core/Src/main.c:187:13:BlinkStatus	2
-../Core/Src/main.c:198:6:Error_Handler	1
+../Core/Src/main.c:154:13:UART_ProcessCommand	8
+../Core/Src/main.c:197:13:UART_SendText	1
+../Core/Src/main.c:202:13:BlinkStatus	2
+../Core/Src/main.c:213:6:Error_Handler	1
