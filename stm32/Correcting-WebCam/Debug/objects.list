@@ -1,3 +1,8 @@
+"./Core/Src/freertos_heap_4.o"
+"./Core/Src/freertos_list.o"
+"./Core/Src/freertos_port.o"
+"./Core/Src/freertos_queue.o"
+"./Core/Src/freertos_tasks.o"
 "./Core/Src/main.o"
 "./Core/Src/stm32f4xx_hal_msp.o"
 "./Core/Src/stm32f4xx_it.o"
