@@ -22,7 +22,6 @@ UART_HandleTypeDef huart1;
 /* USER CODE BEGIN PV */
 static char uart_rx_line[UART_RX_LINE_MAX];
 static uint8_t uart_rx_index = 0U;
-static uint32_t last_heartbeat_ms = 0U;
 /* USER CODE END PV */
 
 void SystemClock_Config(void);
@@ -49,12 +48,6 @@ int main(void)
   while (1)
   {
     UART_PollCommand();
-
-    if ((HAL_GetTick() - last_heartbeat_ms) >= 1000U)
-    {
-      HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-      last_heartbeat_ms = HAL_GetTick();
-    }
   }
 }
 
@@ -200,8 +193,6 @@ static void BlinkStatus(uint8_t count)
     HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
     HAL_Delay(80U);
   }
-
-  last_heartbeat_ms = HAL_GetTick();
 }
 
 void Error_Handler(void)
