@@ -2,97 +2,121 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : FreeRTOS UART command receiver for ESP32 -> STM32 testing
+  * @brief          : FreeRTOS ESP32 UART to two-servo controller
   ******************************************************************************
   */
 /* USER CODE END Header */
 
 #include "main.h"
 
-/* USER CODE BEGIN Includes */
 #include "FreeRTOS.h"
 #include "queue.h"
 #include "task.h"
 #include <string.h>
-/* USER CODE END Includes */
 
-/* USER CODE BEGIN PD */
-#define UART_RX_LINE_MAX 64U
+/* Servo pins:
+ *   PAN  = D12 / PA6
+ *   TILT = D11 / PA7
+ */
+#define PAN_Pin GPIO_PIN_6
+#define PAN_GPIO_Port GPIOA
+#define TILT_Pin GPIO_PIN_7
+#define TILT_GPIO_Port GPIOA
+
+/* Tune this first. Larger values track faster but can look jumpy. */
+#define SERVO_STEP_US 25U
+
+#define PAN_MIN_US 800U
+#define PAN_CENTER_US 1500U
+#define PAN_MAX_US 2200U
+
+#define TILT_MIN_US 1200U
+#define TILT_CENTER_US 1500U
+#define TILT_MAX_US 2000U
+
+#define UART_LINE_MAX 64U
 #define COMMAND_QUEUE_LENGTH 8U
-#define LED_QUEUE_LENGTH 8U
+#define SERVO_QUEUE_LENGTH 8U
 #define COMMAND_TIMEOUT_MS 500U
-/* USER CODE END PD */
 
-/* USER CODE BEGIN PTD */
 typedef enum
 {
   COMMAND_PING,
-  COMMAND_LED_ON,
-  COMMAND_LED_OFF,
-  COMMAND_BLINK,
   COMMAND_PAN_TILT,
   COMMAND_STOP,
+  COMMAND_CENTER,
   COMMAND_TIMEOUT_STOP,
   COMMAND_UNKNOWN
 } CommandType;
 
+typedef enum
+{
+  DIR_STOP,
+  DIR_LEFT,
+  DIR_RIGHT,
+  DIR_UP,
+  DIR_DOWN
+} Direction;
+
 typedef struct
 {
   CommandType type;
-  char text[UART_RX_LINE_MAX];
+  Direction pan;
+  Direction tilt;
+  char text[UART_LINE_MAX];
 } CommandMessage;
 
-typedef enum
+typedef struct
 {
-  LED_ACTION_OFF,
-  LED_ACTION_ON,
-  LED_ACTION_BLINK_ONCE,
-  LED_ACTION_BLINK_THREE
-} LedAction;
-/* USER CODE END PTD */
+  CommandType type;
+  Direction pan;
+  Direction tilt;
+} ServoCommand;
 
 UART_HandleTypeDef huart1;
 
-/* USER CODE BEGIN PV */
 static QueueHandle_t commandQueue;
-static QueueHandle_t ledQueue;
+static QueueHandle_t servoQueue;
 static volatile TickType_t lastCommandTick;
 static volatile uint8_t commandSeen;
 static volatile uint8_t timeoutStopSent;
-/* USER CODE END PV */
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-
-/* USER CODE BEGIN PFP */
 static void MX_USART1_UART_Init(void);
+
 static void UartRxTask(void *argument);
 static void CommandTask(void *argument);
+static void ServoTask(void *argument);
 static void SafetyTask(void *argument);
-static void LedTask(void *argument);
+
 static void ParseCommand(const char *line, CommandMessage *message);
+static Direction ParsePanDirection(const char *line);
+static Direction ParseTiltDirection(const char *line);
 static void ProcessCommand(const CommandMessage *message);
+static void QueueServoCommand(CommandType type, Direction pan, Direction tilt);
+
+static void Servo_ApplyCommand(const ServoCommand *command, uint16_t *pan_us, uint16_t *tilt_us);
+static uint16_t ClampPulse(int32_t pulse, uint16_t min_us, uint16_t max_us);
+static void Servo_WriteFrame(uint16_t pan_us, uint16_t tilt_us);
+static void Delay_Us(uint32_t microseconds);
+
 static void UART_SendText(const char *text);
-static void QueueLedAction(LedAction action);
-static void BlinkStatus(uint8_t count);
-/* USER CODE END PFP */
+static void BlinkOk(void);
 
 int main(void)
 {
   HAL_Init();
   SystemClock_Config();
-
   MX_GPIO_Init();
   MX_USART1_UART_Init();
 
-  commandQueue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(CommandMessage));
-  if (commandQueue == NULL)
-  {
-    Error_Handler();
-  }
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
-  ledQueue = xQueueCreate(LED_QUEUE_LENGTH, sizeof(LedAction));
-  if (ledQueue == NULL)
+  commandQueue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(CommandMessage));
+  servoQueue = xQueueCreate(SERVO_QUEUE_LENGTH, sizeof(ServoCommand));
+  if ((commandQueue == NULL) || (servoQueue == NULL))
   {
     Error_Handler();
   }
@@ -111,20 +135,17 @@ int main(void)
     Error_Handler();
   }
 
+  if (xTaskCreate(ServoTask, "servo", 256, NULL, 4, NULL) != pdPASS)
+  {
+    Error_Handler();
+  }
+
   if (xTaskCreate(SafetyTask, "safety", 128, NULL, 1, NULL) != pdPASS)
   {
     Error_Handler();
   }
 
-  if (xTaskCreate(LedTask, "led", 128, NULL, 2, NULL) != pdPASS)
-  {
-    Error_Handler();
-  }
-
-  UART_SendText("\r\nSTM32 FreeRTOS receiver ready.\r\n");
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
-  HAL_Delay(100U);
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+  UART_SendText("\r\nSTM32 FreeRTOS servo controller ready.\r\n");
   vTaskStartScheduler();
 
   Error_Handler();
@@ -174,12 +195,20 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOH_CLK_ENABLE();
 
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(PAN_GPIO_Port, PAN_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(TILT_GPIO_Port, TILT_Pin, GPIO_PIN_RESET);
 
   GPIO_InitStruct.Pin = LD2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = PAN_Pin | TILT_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 
 static void MX_USART1_UART_Init(void)
@@ -202,11 +231,9 @@ static void UartRxTask(void *argument)
 {
   (void)argument;
 
-  char line[UART_RX_LINE_MAX];
+  char line[UART_LINE_MAX];
   uint8_t lineIndex = 0U;
   uint8_t rxByte = 0U;
-
-  UART_SendText("UART_RX_TASK_STARTED\r\n");
 
   for (;;)
   {
@@ -229,7 +256,7 @@ static void UartRxTask(void *argument)
       continue;
     }
 
-    if (lineIndex < (UART_RX_LINE_MAX - 1U))
+    if (lineIndex < (UART_LINE_MAX - 1U))
     {
       line[lineIndex] = (char)rxByte;
       lineIndex++;
@@ -264,6 +291,27 @@ static void CommandTask(void *argument)
   }
 }
 
+static void ServoTask(void *argument)
+{
+  (void)argument;
+
+  uint16_t pan_us = PAN_CENTER_US;
+  uint16_t tilt_us = TILT_CENTER_US;
+  ServoCommand command;
+  TickType_t lastWake = xTaskGetTickCount();
+
+  for (;;)
+  {
+    while (xQueueReceive(servoQueue, &command, 0U) == pdPASS)
+    {
+      Servo_ApplyCommand(&command, &pan_us, &tilt_us);
+    }
+
+    Servo_WriteFrame(pan_us, tilt_us);
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(20U));
+  }
+}
+
 static void SafetyTask(void *argument)
 {
   (void)argument;
@@ -274,49 +322,12 @@ static void SafetyTask(void *argument)
 
     if (commandSeen && !timeoutStopSent && ((now - lastCommandTick) >= pdMS_TO_TICKS(COMMAND_TIMEOUT_MS)))
     {
-      CommandMessage stopMessage = {0};
-      stopMessage.type = COMMAND_TIMEOUT_STOP;
-      (void)strncpy(stopMessage.text, "PAN=STOP,TILT=STOP", sizeof(stopMessage.text) - 1U);
-      (void)xQueueSend(commandQueue, &stopMessage, 0U);
+      QueueServoCommand(COMMAND_TIMEOUT_STOP, DIR_STOP, DIR_STOP);
+      UART_SendText("OK TIMEOUT_STOP\r\n");
       timeoutStopSent = 1U;
     }
 
     vTaskDelay(pdMS_TO_TICKS(50U));
-  }
-}
-
-static void LedTask(void *argument)
-{
-  (void)argument;
-
-  LedAction action;
-
-  for (;;)
-  {
-    if (xQueueReceive(ledQueue, &action, portMAX_DELAY) == pdPASS)
-    {
-      switch (action)
-      {
-        case LED_ACTION_ON:
-          HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
-          break;
-
-        case LED_ACTION_OFF:
-          HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
-          break;
-
-        case LED_ACTION_BLINK_ONCE:
-          BlinkStatus(1U);
-          break;
-
-        case LED_ACTION_BLINK_THREE:
-          BlinkStatus(3U);
-          break;
-
-        default:
-          break;
-      }
-    }
   }
 }
 
@@ -329,30 +340,52 @@ static void ParseCommand(const char *line, CommandMessage *message)
   {
     message->type = COMMAND_PING;
   }
-  else if (strcmp(line, "LED_ON") == 0)
+  else if (strcmp(line, "CENTER") == 0)
   {
-    message->type = COMMAND_LED_ON;
-  }
-  else if (strcmp(line, "LED_OFF") == 0)
-  {
-    message->type = COMMAND_LED_OFF;
-  }
-  else if (strcmp(line, "BLINK") == 0)
-  {
-    message->type = COMMAND_BLINK;
+    message->type = COMMAND_CENTER;
   }
   else if (strcmp(line, "PAN=STOP,TILT=STOP") == 0)
   {
     message->type = COMMAND_STOP;
+    message->pan = DIR_STOP;
+    message->tilt = DIR_STOP;
   }
   else if (strncmp(line, "PAN=", 4) == 0)
   {
     message->type = COMMAND_PAN_TILT;
+    message->pan = ParsePanDirection(line);
+    message->tilt = ParseTiltDirection(line);
   }
   else
   {
     message->type = COMMAND_UNKNOWN;
   }
+}
+
+static Direction ParsePanDirection(const char *line)
+{
+  if (strstr(line, "PAN=LEFT") != NULL)
+  {
+    return DIR_LEFT;
+  }
+  if (strstr(line, "PAN=RIGHT") != NULL)
+  {
+    return DIR_RIGHT;
+  }
+  return DIR_STOP;
+}
+
+static Direction ParseTiltDirection(const char *line)
+{
+  if (strstr(line, "TILT=UP") != NULL)
+  {
+    return DIR_UP;
+  }
+  if (strstr(line, "TILT=DOWN") != NULL)
+  {
+    return DIR_DOWN;
+  }
+  return DIR_STOP;
 }
 
 static void ProcessCommand(const CommandMessage *message)
@@ -361,38 +394,21 @@ static void ProcessCommand(const CommandMessage *message)
   {
     case COMMAND_PING:
       UART_SendText("OK PING\r\n");
-      QueueLedAction(LED_ACTION_BLINK_ONCE);
+      BlinkOk();
       break;
 
-    case COMMAND_LED_ON:
-      QueueLedAction(LED_ACTION_ON);
-      UART_SendText("OK LED_ON\r\n");
-      break;
-
-    case COMMAND_LED_OFF:
-      QueueLedAction(LED_ACTION_OFF);
-      UART_SendText("OK LED_OFF\r\n");
-      break;
-
-    case COMMAND_BLINK:
-      UART_SendText("OK BLINK\r\n");
-      QueueLedAction(LED_ACTION_BLINK_THREE);
+    case COMMAND_CENTER:
+      QueueServoCommand(COMMAND_CENTER, DIR_STOP, DIR_STOP);
+      UART_SendText("OK CENTER\r\n");
       break;
 
     case COMMAND_STOP:
-      QueueLedAction(LED_ACTION_OFF);
-      UART_SendText("OK ");
-      UART_SendText(message->text);
-      UART_SendText("\r\n");
-      break;
-
-    case COMMAND_TIMEOUT_STOP:
-      QueueLedAction(LED_ACTION_OFF);
-      UART_SendText("OK TIMEOUT_STOP\r\n");
+      QueueServoCommand(COMMAND_STOP, DIR_STOP, DIR_STOP);
+      UART_SendText("OK PAN=STOP,TILT=STOP\r\n");
       break;
 
     case COMMAND_PAN_TILT:
-      QueueLedAction(LED_ACTION_ON);
+      QueueServoCommand(COMMAND_PAN_TILT, message->pan, message->tilt);
       UART_SendText("OK ");
       UART_SendText(message->text);
       UART_SendText("\r\n");
@@ -404,28 +420,118 @@ static void ProcessCommand(const CommandMessage *message)
   }
 }
 
+static void QueueServoCommand(CommandType type, Direction pan, Direction tilt)
+{
+  ServoCommand command;
+  command.type = type;
+  command.pan = pan;
+  command.tilt = tilt;
+  (void)xQueueSend(servoQueue, &command, 0U);
+}
+
+static void Servo_ApplyCommand(const ServoCommand *command, uint16_t *pan_us, uint16_t *tilt_us)
+{
+  if (command->type == COMMAND_CENTER)
+  {
+    *pan_us = PAN_CENTER_US;
+    *tilt_us = TILT_CENTER_US;
+    return;
+  }
+
+  if ((command->type == COMMAND_STOP) || (command->type == COMMAND_TIMEOUT_STOP))
+  {
+    return;
+  }
+
+  if (command->pan == DIR_LEFT)
+  {
+    *pan_us = ClampPulse((int32_t)*pan_us - (int32_t)SERVO_STEP_US, PAN_MIN_US, PAN_MAX_US);
+  }
+  else if (command->pan == DIR_RIGHT)
+  {
+    *pan_us = ClampPulse((int32_t)*pan_us + (int32_t)SERVO_STEP_US, PAN_MIN_US, PAN_MAX_US);
+  }
+
+  if (command->tilt == DIR_UP)
+  {
+    *tilt_us = ClampPulse((int32_t)*tilt_us - (int32_t)SERVO_STEP_US, TILT_MIN_US, TILT_MAX_US);
+  }
+  else if (command->tilt == DIR_DOWN)
+  {
+    *tilt_us = ClampPulse((int32_t)*tilt_us + (int32_t)SERVO_STEP_US, TILT_MIN_US, TILT_MAX_US);
+  }
+}
+
+static uint16_t ClampPulse(int32_t pulse, uint16_t min_us, uint16_t max_us)
+{
+  if (pulse < (int32_t)min_us)
+  {
+    return min_us;
+  }
+  if (pulse > (int32_t)max_us)
+  {
+    return max_us;
+  }
+  return (uint16_t)pulse;
+}
+
+static void Servo_WriteFrame(uint16_t pan_us, uint16_t tilt_us)
+{
+  uint16_t first = pan_us;
+  uint16_t second = tilt_us;
+  uint32_t elapsed_us = 0U;
+
+  taskENTER_CRITICAL();
+
+  HAL_GPIO_WritePin(PAN_GPIO_Port, PAN_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(TILT_GPIO_Port, TILT_Pin, GPIO_PIN_SET);
+
+  if (first <= second)
+  {
+    Delay_Us(first);
+    HAL_GPIO_WritePin(PAN_GPIO_Port, PAN_Pin, GPIO_PIN_RESET);
+    elapsed_us = first;
+
+    Delay_Us(second - first);
+    HAL_GPIO_WritePin(TILT_GPIO_Port, TILT_Pin, GPIO_PIN_RESET);
+    elapsed_us = second;
+  }
+  else
+  {
+    Delay_Us(second);
+    HAL_GPIO_WritePin(TILT_GPIO_Port, TILT_Pin, GPIO_PIN_RESET);
+    elapsed_us = second;
+
+    Delay_Us(first - second);
+    HAL_GPIO_WritePin(PAN_GPIO_Port, PAN_Pin, GPIO_PIN_RESET);
+    elapsed_us = first;
+  }
+
+  (void)elapsed_us;
+
+  taskEXIT_CRITICAL();
+}
+
+static void Delay_Us(uint32_t microseconds)
+{
+  uint32_t start = DWT->CYCCNT;
+  uint32_t ticks = microseconds * (SystemCoreClock / 1000000U);
+
+  while ((DWT->CYCCNT - start) < ticks)
+  {
+  }
+}
+
 static void UART_SendText(const char *text)
 {
   HAL_UART_Transmit(&huart1, (uint8_t *)text, (uint16_t)strlen(text), HAL_MAX_DELAY);
 }
 
-static void QueueLedAction(LedAction action)
+static void BlinkOk(void)
 {
-  if (ledQueue != NULL)
-  {
-    (void)xQueueSend(ledQueue, &action, 0U);
-  }
-}
-
-static void BlinkStatus(uint8_t count)
-{
-  for (uint8_t i = 0U; i < count; i++)
-  {
-    HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
-    vTaskDelay(pdMS_TO_TICKS(200U));
-    HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
-    vTaskDelay(pdMS_TO_TICKS(200U));
-  }
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+  vTaskDelay(pdMS_TO_TICKS(80U));
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 }
 
 void Error_Handler(void)

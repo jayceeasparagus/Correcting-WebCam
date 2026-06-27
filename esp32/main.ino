@@ -26,6 +26,7 @@ static WiFiClient client;
 
 static String usbLine;
 static String stm32Line;
+static unsigned long lastStatusPrintMs = 0;
 
 static void connectToWiFi();
 static void acceptTcpClient();
@@ -64,6 +65,17 @@ void loop()
   readTcpCommand();
   readUsbCommand();
   readStm32Response();
+
+  unsigned long now = millis();
+  if (now - lastStatusPrintMs >= 5000) {
+    lastStatusPrintMs = now;
+    Serial.print("ESP32 status: IP=");
+    Serial.print(WiFi.localIP());
+    Serial.print(" port=");
+    Serial.print(TCP_PORT);
+    Serial.print(" client=");
+    Serial.println((client && client.connected()) ? "connected" : "waiting");
+  }
 }
 
 static void connectToWiFi()
@@ -86,6 +98,10 @@ static void acceptTcpClient()
 {
   if (client && client.connected()) {
     return;
+  }
+
+  if (client) {
+    client.stop();
   }
 
   WiFiClient newClient = server.available();
