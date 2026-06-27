@@ -445,20 +445,20 @@ static void Servo_ApplyCommand(const ServoCommand *command, uint16_t *pan_us, ui
 
   if (command->pan == DIR_LEFT)
   {
-    *pan_us = ClampPulse((int32_t)*pan_us - (int32_t)SERVO_STEP_US, PAN_MIN_US, PAN_MAX_US);
+    *pan_us = ClampPulse((int32_t)*pan_us + (int32_t)SERVO_STEP_US, PAN_MIN_US, PAN_MAX_US);
   }
   else if (command->pan == DIR_RIGHT)
   {
-    *pan_us = ClampPulse((int32_t)*pan_us + (int32_t)SERVO_STEP_US, PAN_MIN_US, PAN_MAX_US);
+    *pan_us = ClampPulse((int32_t)*pan_us - (int32_t)SERVO_STEP_US, PAN_MIN_US, PAN_MAX_US);
   }
 
   if (command->tilt == DIR_UP)
   {
-    *tilt_us = ClampPulse((int32_t)*tilt_us - (int32_t)SERVO_STEP_US, TILT_MIN_US, TILT_MAX_US);
+    *tilt_us = ClampPulse((int32_t)*tilt_us + (int32_t)SERVO_STEP_US, TILT_MIN_US, TILT_MAX_US);
   }
   else if (command->tilt == DIR_DOWN)
   {
-    *tilt_us = ClampPulse((int32_t)*tilt_us + (int32_t)SERVO_STEP_US, TILT_MIN_US, TILT_MAX_US);
+    *tilt_us = ClampPulse((int32_t)*tilt_us - (int32_t)SERVO_STEP_US, TILT_MIN_US, TILT_MAX_US);
   }
 }
 

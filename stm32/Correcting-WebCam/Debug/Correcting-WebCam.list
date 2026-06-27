@@ -6476,10 +6476,10 @@ static void Servo_ApplyCommand(const ServoCommand *command, uint16_t *pan_us, ui
  80024f6:	2b01      	cmp	r3, #1
  80024f8:	d10e      	bne.n	8002518 <Servo_ApplyCommand+0x5c>
   {
-    *pan_us = ClampPulse((int32_t)*pan_us - (int32_t)SERVO_STEP_US, PAN_MIN_US, PAN_MAX_US);
+    *pan_us = ClampPulse((int32_t)*pan_us + (int32_t)SERVO_STEP_US, PAN_MIN_US, PAN_MAX_US);
  80024fa:	68bb      	ldr	r3, [r7, #8]
  80024fc:	881b      	ldrh	r3, [r3, #0]
- 80024fe:	3b19      	subs	r3, #25
+ 80024fe:	3319      	adds	r3, #25
  8002500:	f640 0298 	movw	r2, #2200	@ 0x898
  8002504:	f44f 7148 	mov.w	r1, #800	@ 0x320
  8002508:	4618      	mov	r0, r3
@@ -6496,10 +6496,10 @@ static void Servo_ApplyCommand(const ServoCommand *command, uint16_t *pan_us, ui
  800251c:	2b02      	cmp	r3, #2
  800251e:	d10d      	bne.n	800253c <Servo_ApplyCommand+0x80>
   {
-    *pan_us = ClampPulse((int32_t)*pan_us + (int32_t)SERVO_STEP_US, PAN_MIN_US, PAN_MAX_US);
+    *pan_us = ClampPulse((int32_t)*pan_us - (int32_t)SERVO_STEP_US, PAN_MIN_US, PAN_MAX_US);
  8002520:	68bb      	ldr	r3, [r7, #8]
  8002522:	881b      	ldrh	r3, [r3, #0]
- 8002524:	3319      	adds	r3, #25
+ 8002524:	3b19      	subs	r3, #25
  8002526:	f640 0298 	movw	r2, #2200	@ 0x898
  800252a:	f44f 7148 	mov.w	r1, #800	@ 0x320
  800252e:	4618      	mov	r0, r3
@@ -6516,10 +6516,10 @@ static void Servo_ApplyCommand(const ServoCommand *command, uint16_t *pan_us, ui
  8002540:	2b03      	cmp	r3, #3
  8002542:	d10e      	bne.n	8002562 <Servo_ApplyCommand+0xa6>
   {
-    *tilt_us = ClampPulse((int32_t)*tilt_us - (int32_t)SERVO_STEP_US, TILT_MIN_US, TILT_MAX_US);
+    *tilt_us = ClampPulse((int32_t)*tilt_us + (int32_t)SERVO_STEP_US, TILT_MIN_US, TILT_MAX_US);
  8002544:	687b      	ldr	r3, [r7, #4]
  8002546:	881b      	ldrh	r3, [r3, #0]
- 8002548:	3b19      	subs	r3, #25
+ 8002548:	3319      	adds	r3, #25
  800254a:	f44f 62fa 	mov.w	r2, #2000	@ 0x7d0
  800254e:	f44f 6196 	mov.w	r1, #1200	@ 0x4b0
  8002552:	4618      	mov	r0, r3
@@ -6536,10 +6536,10 @@ static void Servo_ApplyCommand(const ServoCommand *command, uint16_t *pan_us, ui
  8002566:	2b04      	cmp	r3, #4
  8002568:	d10f      	bne.n	800258a <Servo_ApplyCommand+0xce>
   {
-    *tilt_us = ClampPulse((int32_t)*tilt_us + (int32_t)SERVO_STEP_US, TILT_MIN_US, TILT_MAX_US);
+    *tilt_us = ClampPulse((int32_t)*tilt_us - (int32_t)SERVO_STEP_US, TILT_MIN_US, TILT_MAX_US);
  800256a:	687b      	ldr	r3, [r7, #4]
  800256c:	881b      	ldrh	r3, [r3, #0]
- 800256e:	3319      	adds	r3, #25
+ 800256e:	3b19      	subs	r3, #25
  8002570:	f44f 62fa 	mov.w	r2, #2000	@ 0x7d0
  8002574:	f44f 6196 	mov.w	r1, #1200	@ 0x4b0
  8002578:	4618      	mov	r0, r3
