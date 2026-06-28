@@ -23,10 +23,29 @@ YUNET_MODEL_URL = (
     "https://github.com/opencv/opencv_zoo/raw/main/models/"
     "face_detection_yunet/face_detection_yunet_2023mar.onnx"
 )
+OPEN_CV_DNN_PROTO_URL = (
+    "https://raw.githubusercontent.com/opencv/opencv/master/"
+    "samples/dnn/face_detector/deploy.prototxt"
+)
+OPEN_CV_DNN_MODEL_URL = (
+    "https://raw.githubusercontent.com/opencv/opencv_3rdparty/"
+    "dnn_samples_face_detector_20170830/"
+    "res10_300x300_ssd_iter_140000.caffemodel"
+)
 DEFAULT_YUNET_MODEL = (
     Path(__file__).resolve().parent
     / "models"
     / "face_detection_yunet_2023mar.onnx"
+)
+DEFAULT_DNN_PROTO = (
+    Path(__file__).resolve().parent
+    / "models"
+    / "deploy.prototxt"
+)
+DEFAULT_DNN_MODEL = (
+    Path(__file__).resolve().parent
+    / "models"
+    / "res10_300x300_ssd_iter_140000.caffemodel"
 )
 
 
@@ -167,17 +186,102 @@ class YuNetFaceDetector:
         return faces
 
 
+class DnnFaceDetector:
+    name = "dnn"
+
+    def __init__(self, proto_path, model_path, score_threshold):
+        self.net = cv2.dnn.readNetFromCaffe(
+            str(proto_path),
+            str(model_path),
+        )
+        self.score_threshold = score_threshold
+
+    def detect(self, frame):
+        frame_height, frame_width = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(
+            frame,
+            1.0,
+            (300, 300),
+            (104.0, 177.0, 123.0),
+        )
+        self.net.setInput(blob)
+        detections = self.net.forward()
+
+        faces = []
+
+        for i in range(detections.shape[2]):
+            confidence = float(detections[0, 0, i, 2])
+
+            if confidence < self.score_threshold:
+                continue
+
+            box = detections[0, 0, i, 3:7]
+            x1, y1, x2, y2 = box * [
+                frame_width,
+                frame_height,
+                frame_width,
+                frame_height,
+            ]
+            x = max(0, int(round(x1)))
+            y = max(0, int(round(y1)))
+            width = max(0, int(round(x2 - x1)))
+            height = max(0, int(round(y2 - y1)))
+
+            faces.append((x, y, width, height))
+
+        return faces
+
+
 def download_yunet_model(model_path):
     model_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading YuNet model to {model_path}")
     urllib.request.urlretrieve(YUNET_MODEL_URL, model_path)
 
 
+def download_dnn_model(proto_path, model_path):
+    proto_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading OpenCV DNN deploy file to {proto_path}")
+    urllib.request.urlretrieve(OPEN_CV_DNN_PROTO_URL, proto_path)
+    print(f"Downloading OpenCV DNN model to {model_path}")
+    urllib.request.urlretrieve(OPEN_CV_DNN_MODEL_URL, model_path)
+
+
 def create_face_detector(args):
     model_path = Path(args.yunet_model)
+    dnn_proto_path = Path(args.dnn_proto)
+    dnn_model_path = Path(args.dnn_model)
 
     if args.download_yunet and not model_path.exists():
         download_yunet_model(model_path)
+
+    if (
+        args.download_dnn
+        and (
+            not dnn_proto_path.exists()
+            or not dnn_model_path.exists()
+        )
+    ):
+        download_dnn_model(dnn_proto_path, dnn_model_path)
+
+    if args.detector in ("auto", "dnn") and dnn_proto_path.exists() and dnn_model_path.exists():
+        try:
+            detector = DnnFaceDetector(
+                proto_path=dnn_proto_path,
+                model_path=dnn_model_path,
+                score_threshold=args.dnn_score,
+            )
+            print(f"Using OpenCV DNN face detector: {dnn_model_path}")
+            return detector
+        except cv2.error as error:
+            if args.detector == "dnn":
+                raise RuntimeError(f"Could not load OpenCV DNN detector: {error}")
+            print(f"OpenCV DNN unavailable, trying next detector: {error}")
+
+    if args.detector == "dnn":
+        raise RuntimeError(
+            f"OpenCV DNN model files not found: {dnn_proto_path}, "
+            f"{dnn_model_path}. Run with --download-dnn or choose another detector."
+        )
 
     if args.detector in ("auto", "yunet") and model_path.exists():
         try:
@@ -250,9 +354,30 @@ def parse_args():
     )
     parser.add_argument(
         "--detector",
-        choices=("auto", "yunet", "haar"),
-        default="auto",
-        help="Face detector to use. Auto prefers YuNet if the model exists.",
+        choices=("auto", "dnn", "yunet", "haar"),
+        default="dnn",
+        help="Face detector to use. Default is OpenCV DNN.",
+    )
+    parser.add_argument(
+        "--dnn-proto",
+        default=str(DEFAULT_DNN_PROTO),
+        help="Path to OpenCV DNN deploy.prototxt.",
+    )
+    parser.add_argument(
+        "--dnn-model",
+        default=str(DEFAULT_DNN_MODEL),
+        help="Path to OpenCV DNN Caffe model.",
+    )
+    parser.add_argument(
+        "--download-dnn",
+        action="store_true",
+        help="Download the OpenCV DNN face detector files if missing.",
+    )
+    parser.add_argument(
+        "--dnn-score",
+        type=float,
+        default=0.6,
+        help="OpenCV DNN confidence threshold. Lower detects more, higher is stricter.",
     )
     parser.add_argument(
         "--yunet-model",
