@@ -23,8 +23,14 @@
 #define TILT_Pin GPIO_PIN_7
 #define TILT_GPIO_Port GPIOA
 
-/* Tune this first. Larger values track faster but can look jumpy. */
-#define SERVO_STEP_US 25U
+/* Tune these first. Error-scaled movement is:
+ *   step = SERVO_MIN_STEP_US + abs(error) * SERVO_GAIN_NUM / SERVO_GAIN_DEN
+ * then clamped to SERVO_MAX_STEP_US.
+ */
+#define SERVO_MIN_STEP_US 8U
+#define SERVO_MAX_STEP_US 45U
+#define SERVO_GAIN_NUM 1U
+#define SERVO_GAIN_DEN 6U
 
 #define PAN_MIN_US 800U
 #define PAN_CENTER_US 1500U
@@ -63,6 +69,8 @@ typedef struct
   CommandType type;
   Direction pan;
   Direction tilt;
+  int16_t error_x;
+  int16_t error_y;
   char text[UART_LINE_MAX];
 } CommandMessage;
 
@@ -71,6 +79,8 @@ typedef struct
   CommandType type;
   Direction pan;
   Direction tilt;
+  int16_t error_x;
+  int16_t error_y;
 } ServoCommand;
 
 UART_HandleTypeDef huart1;
@@ -93,10 +103,13 @@ static void SafetyTask(void *argument);
 static void ParseCommand(const char *line, CommandMessage *message);
 static Direction ParsePanDirection(const char *line);
 static Direction ParseTiltDirection(const char *line);
+static int16_t ParseIntField(const char *line, const char *key);
 static void ProcessCommand(const CommandMessage *message);
-static void QueueServoCommand(CommandType type, Direction pan, Direction tilt);
+static void QueueServoCommand(CommandType type, Direction pan, Direction tilt, int16_t error_x, int16_t error_y);
 
 static void Servo_ApplyCommand(const ServoCommand *command, uint16_t *pan_us, uint16_t *tilt_us);
+static uint16_t ErrorToStepUs(int16_t error);
+static uint16_t AbsI16(int16_t value);
 static uint16_t ClampPulse(int32_t pulse, uint16_t min_us, uint16_t max_us);
 static void Servo_WriteFrame(uint16_t pan_us, uint16_t tilt_us);
 static void Delay_Us(uint32_t microseconds);
@@ -322,7 +335,7 @@ static void SafetyTask(void *argument)
 
     if (commandSeen && !timeoutStopSent && ((now - lastCommandTick) >= pdMS_TO_TICKS(COMMAND_TIMEOUT_MS)))
     {
-      QueueServoCommand(COMMAND_TIMEOUT_STOP, DIR_STOP, DIR_STOP);
+      QueueServoCommand(COMMAND_TIMEOUT_STOP, DIR_STOP, DIR_STOP, 0, 0);
       UART_SendText("OK TIMEOUT_STOP\r\n");
       timeoutStopSent = 1U;
     }
@@ -355,6 +368,8 @@ static void ParseCommand(const char *line, CommandMessage *message)
     message->type = COMMAND_PAN_TILT;
     message->pan = ParsePanDirection(line);
     message->tilt = ParseTiltDirection(line);
+    message->error_x = ParseIntField(line, "EX=");
+    message->error_y = ParseIntField(line, "EY=");
   }
   else
   {
@@ -373,6 +388,45 @@ static Direction ParsePanDirection(const char *line)
     return DIR_RIGHT;
   }
   return DIR_STOP;
+}
+
+static int16_t ParseIntField(const char *line, const char *key)
+{
+  const char *field = strstr(line, key);
+
+  if (field == NULL)
+  {
+    return 0;
+  }
+
+  field += strlen(key);
+
+  int sign = 1;
+  if (*field == '-')
+  {
+    sign = -1;
+    field++;
+  }
+
+  int32_t value = 0;
+  while ((*field >= '0') && (*field <= '9'))
+  {
+    value = (value * 10) + (*field - '0');
+    field++;
+  }
+
+  value *= sign;
+
+  if (value < -32768)
+  {
+    return -32768;
+  }
+  if (value > 32767)
+  {
+    return 32767;
+  }
+
+  return (int16_t)value;
 }
 
 static Direction ParseTiltDirection(const char *line)
@@ -398,17 +452,17 @@ static void ProcessCommand(const CommandMessage *message)
       break;
 
     case COMMAND_CENTER:
-      QueueServoCommand(COMMAND_CENTER, DIR_STOP, DIR_STOP);
+      QueueServoCommand(COMMAND_CENTER, DIR_STOP, DIR_STOP, 0, 0);
       UART_SendText("OK CENTER\r\n");
       break;
 
     case COMMAND_STOP:
-      QueueServoCommand(COMMAND_STOP, DIR_STOP, DIR_STOP);
+      QueueServoCommand(COMMAND_STOP, DIR_STOP, DIR_STOP, 0, 0);
       UART_SendText("OK PAN=STOP,TILT=STOP\r\n");
       break;
 
     case COMMAND_PAN_TILT:
-      QueueServoCommand(COMMAND_PAN_TILT, message->pan, message->tilt);
+      QueueServoCommand(COMMAND_PAN_TILT, message->pan, message->tilt, message->error_x, message->error_y);
       UART_SendText("OK ");
       UART_SendText(message->text);
       UART_SendText("\r\n");
@@ -420,12 +474,14 @@ static void ProcessCommand(const CommandMessage *message)
   }
 }
 
-static void QueueServoCommand(CommandType type, Direction pan, Direction tilt)
+static void QueueServoCommand(CommandType type, Direction pan, Direction tilt, int16_t error_x, int16_t error_y)
 {
   ServoCommand command;
   command.type = type;
   command.pan = pan;
   command.tilt = tilt;
+  command.error_x = error_x;
+  command.error_y = error_y;
   (void)xQueueSend(servoQueue, &command, 0U);
 }
 
@@ -443,23 +499,49 @@ static void Servo_ApplyCommand(const ServoCommand *command, uint16_t *pan_us, ui
     return;
   }
 
+  uint16_t pan_step_us = ErrorToStepUs(command->error_x);
+  uint16_t tilt_step_us = ErrorToStepUs(command->error_y);
+
   if (command->pan == DIR_LEFT)
   {
-    *pan_us = ClampPulse((int32_t)*pan_us + (int32_t)SERVO_STEP_US, PAN_MIN_US, PAN_MAX_US);
+    *pan_us = ClampPulse((int32_t)*pan_us + (int32_t)pan_step_us, PAN_MIN_US, PAN_MAX_US);
   }
   else if (command->pan == DIR_RIGHT)
   {
-    *pan_us = ClampPulse((int32_t)*pan_us - (int32_t)SERVO_STEP_US, PAN_MIN_US, PAN_MAX_US);
+    *pan_us = ClampPulse((int32_t)*pan_us - (int32_t)pan_step_us, PAN_MIN_US, PAN_MAX_US);
   }
 
   if (command->tilt == DIR_UP)
   {
-    *tilt_us = ClampPulse((int32_t)*tilt_us + (int32_t)SERVO_STEP_US, TILT_MIN_US, TILT_MAX_US);
+    *tilt_us = ClampPulse((int32_t)*tilt_us + (int32_t)tilt_step_us, TILT_MIN_US, TILT_MAX_US);
   }
   else if (command->tilt == DIR_DOWN)
   {
-    *tilt_us = ClampPulse((int32_t)*tilt_us - (int32_t)SERVO_STEP_US, TILT_MIN_US, TILT_MAX_US);
+    *tilt_us = ClampPulse((int32_t)*tilt_us - (int32_t)tilt_step_us, TILT_MIN_US, TILT_MAX_US);
   }
+}
+
+static uint16_t ErrorToStepUs(int16_t error)
+{
+  uint32_t magnitude = (uint32_t)AbsI16(error);
+  uint32_t step = SERVO_MIN_STEP_US + ((magnitude * SERVO_GAIN_NUM) / SERVO_GAIN_DEN);
+
+  if (step > SERVO_MAX_STEP_US)
+  {
+    return SERVO_MAX_STEP_US;
+  }
+
+  return (uint16_t)step;
+}
+
+static uint16_t AbsI16(int16_t value)
+{
+  if (value < 0)
+  {
+    return (uint16_t)(-(int32_t)value);
+  }
+
+  return (uint16_t)value;
 }
 
 static uint16_t ClampPulse(int32_t pulse, uint16_t min_us, uint16_t max_us)

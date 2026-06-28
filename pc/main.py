@@ -1,16 +1,25 @@
+import argparse
 import json
 import socket
 import time
-import argparse
-import urllib.request
-from pathlib import Path
 
 import cv2
 
 
 DEADZONE_X = 40
 DEADZONE_Y = 30
-SMOOTHING_ALPHA = 0.3
+
+# Lower = smoother/slower response, higher = quicker/more jittery.
+SMOOTHING_ALPHA = 0.22
+
+# Limits one-frame jumps before the EMA filter sees them.
+MAX_ERROR_DELTA_X = 45
+MAX_ERROR_DELTA_Y = 35
+
+# Prevents command chatter near the deadzone edge.
+COMMAND_HYSTERESIS_X = 12
+COMMAND_HYSTERESIS_Y = 10
+
 MAX_MISSED_FRAMES = 5
 
 ESP32_IP = "192.168.1.12"
@@ -18,35 +27,6 @@ ESP32_PORT = 5000
 
 # Send at 10 Hz instead of once per camera frame.
 COMMAND_INTERVAL_SECONDS = 0.1
-
-YUNET_MODEL_URL = (
-    "https://github.com/opencv/opencv_zoo/raw/main/models/"
-    "face_detection_yunet/face_detection_yunet_2023mar.onnx"
-)
-OPEN_CV_DNN_PROTO_URL = (
-    "https://raw.githubusercontent.com/opencv/opencv/master/"
-    "samples/dnn/face_detector/deploy.prototxt"
-)
-OPEN_CV_DNN_MODEL_URL = (
-    "https://raw.githubusercontent.com/opencv/opencv_3rdparty/"
-    "dnn_samples_face_detector_20170830/"
-    "res10_300x300_ssd_iter_140000.caffemodel"
-)
-DEFAULT_YUNET_MODEL = (
-    Path(__file__).resolve().parent
-    / "models"
-    / "face_detection_yunet_2023mar.onnx"
-)
-DEFAULT_DNN_PROTO = (
-    Path(__file__).resolve().parent
-    / "models"
-    / "deploy.prototxt"
-)
-DEFAULT_DNN_MODEL = (
-    Path(__file__).resolve().parent
-    / "models"
-    / "res10_300x300_ssd_iter_140000.caffemodel"
-)
 
 
 class ESP32Client:
@@ -115,195 +95,49 @@ class ESP32Client:
                 print(f"ESP32: {line}")
 
 
-class HaarFaceDetector:
-    name = "haar"
+class ErrorSmoother:
+    def __init__(self, alpha, max_delta_x, max_delta_y):
+        self.alpha = alpha
+        self.max_delta_x = max_delta_x
+        self.max_delta_y = max_delta_y
+        self.error_x = None
+        self.error_y = None
 
-    def __init__(self):
-        self.classifier = cv2.CascadeClassifier(
-            cv2.data.haarcascades
-            + "haarcascade_frontalface_default.xml"
+    def reset(self):
+        self.error_x = None
+        self.error_y = None
+
+    def update(self, raw_x, raw_y):
+        if self.error_x is None:
+            self.error_x = raw_x
+            self.error_y = raw_y
+            return round(self.error_x), round(self.error_y)
+
+        limited_x = self._limit_jump(raw_x, self.error_x, self.max_delta_x)
+        limited_y = self._limit_jump(raw_y, self.error_y, self.max_delta_y)
+
+        self.error_x = (
+            self.alpha * limited_x
+            + (1 - self.alpha) * self.error_x
+        )
+        self.error_y = (
+            self.alpha * limited_y
+            + (1 - self.alpha) * self.error_y
         )
 
-        if self.classifier.empty():
-            raise RuntimeError("Could not load Haar face detector.")
+        return round(self.error_x), round(self.error_y)
 
-    def detect(self, frame):
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.classifier.detectMultiScale(
-            gray_frame,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(60, 60),
-        )
-        return [tuple(map(int, face)) for face in faces]
+    @staticmethod
+    def _limit_jump(raw_value, previous_value, max_delta):
+        delta = raw_value - previous_value
 
+        if delta > max_delta:
+            return previous_value + max_delta
 
-class YuNetFaceDetector:
-    name = "yunet"
+        if delta < -max_delta:
+            return previous_value - max_delta
 
-    def __init__(self, model_path, score_threshold):
-        if not hasattr(cv2, "FaceDetectorYN_create"):
-            raise RuntimeError(
-                "This OpenCV install does not include FaceDetectorYN/YuNet."
-            )
-
-        self.detector = cv2.FaceDetectorYN_create(
-            str(model_path),
-            "",
-            (320, 320),
-            score_threshold,
-            0.3,
-            5000,
-        )
-        self.input_size = None
-
-    def detect(self, frame):
-        frame_height, frame_width = frame.shape[:2]
-        input_size = (frame_width, frame_height)
-
-        if self.input_size != input_size:
-            self.detector.setInputSize(input_size)
-            self.input_size = input_size
-
-        _, detections = self.detector.detect(frame)
-
-        if detections is None:
-            return []
-
-        faces = []
-
-        for detection in detections:
-            x, y, width, height = detection[:4]
-            faces.append(
-                (
-                    max(0, int(round(x))),
-                    max(0, int(round(y))),
-                    max(0, int(round(width))),
-                    max(0, int(round(height))),
-                )
-            )
-
-        return faces
-
-
-class DnnFaceDetector:
-    name = "dnn"
-
-    def __init__(self, proto_path, model_path, score_threshold):
-        self.net = cv2.dnn.readNetFromCaffe(
-            str(proto_path),
-            str(model_path),
-        )
-        self.score_threshold = score_threshold
-
-    def detect(self, frame):
-        frame_height, frame_width = frame.shape[:2]
-        blob = cv2.dnn.blobFromImage(
-            frame,
-            1.0,
-            (300, 300),
-            (104.0, 177.0, 123.0),
-        )
-        self.net.setInput(blob)
-        detections = self.net.forward()
-
-        faces = []
-
-        for i in range(detections.shape[2]):
-            confidence = float(detections[0, 0, i, 2])
-
-            if confidence < self.score_threshold:
-                continue
-
-            box = detections[0, 0, i, 3:7]
-            x1, y1, x2, y2 = box * [
-                frame_width,
-                frame_height,
-                frame_width,
-                frame_height,
-            ]
-            x = max(0, int(round(x1)))
-            y = max(0, int(round(y1)))
-            width = max(0, int(round(x2 - x1)))
-            height = max(0, int(round(y2 - y1)))
-
-            faces.append((x, y, width, height))
-
-        return faces
-
-
-def download_yunet_model(model_path):
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading YuNet model to {model_path}")
-    urllib.request.urlretrieve(YUNET_MODEL_URL, model_path)
-
-
-def download_dnn_model(proto_path, model_path):
-    proto_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading OpenCV DNN deploy file to {proto_path}")
-    urllib.request.urlretrieve(OPEN_CV_DNN_PROTO_URL, proto_path)
-    print(f"Downloading OpenCV DNN model to {model_path}")
-    urllib.request.urlretrieve(OPEN_CV_DNN_MODEL_URL, model_path)
-
-
-def create_face_detector(args):
-    model_path = Path(args.yunet_model)
-    dnn_proto_path = Path(args.dnn_proto)
-    dnn_model_path = Path(args.dnn_model)
-
-    if args.download_yunet and not model_path.exists():
-        download_yunet_model(model_path)
-
-    if (
-        args.download_dnn
-        and (
-            not dnn_proto_path.exists()
-            or not dnn_model_path.exists()
-        )
-    ):
-        download_dnn_model(dnn_proto_path, dnn_model_path)
-
-    if args.detector in ("auto", "dnn") and dnn_proto_path.exists() and dnn_model_path.exists():
-        try:
-            detector = DnnFaceDetector(
-                proto_path=dnn_proto_path,
-                model_path=dnn_model_path,
-                score_threshold=args.dnn_score,
-            )
-            print(f"Using OpenCV DNN face detector: {dnn_model_path}")
-            return detector
-        except cv2.error as error:
-            if args.detector == "dnn":
-                raise RuntimeError(f"Could not load OpenCV DNN detector: {error}")
-            print(f"OpenCV DNN unavailable, trying next detector: {error}")
-
-    if args.detector == "dnn":
-        raise RuntimeError(
-            f"OpenCV DNN model files not found: {dnn_proto_path}, "
-            f"{dnn_model_path}. Run with --download-dnn or choose another detector."
-        )
-
-    if args.detector in ("auto", "yunet") and model_path.exists():
-        try:
-            detector = YuNetFaceDetector(
-                model_path=model_path,
-                score_threshold=args.yunet_score,
-            )
-            print(f"Using YuNet face detector: {model_path}")
-            return detector
-        except RuntimeError as error:
-            if args.detector == "yunet":
-                raise
-            print(f"YuNet unavailable, falling back to Haar: {error}")
-
-    if args.detector == "yunet":
-        raise RuntimeError(
-            f"YuNet model not found: {model_path}. "
-            "Run with --download-yunet or choose --detector haar."
-        )
-
-    print("Using Haar cascade face detector.")
-    return HaarFaceDetector()
+        return raw_value
 
 
 def get_face_area(face):
@@ -311,22 +145,50 @@ def get_face_area(face):
     return width * height
 
 
-def get_pan_command(error_x):
-    if error_x < -DEADZONE_X:
-        return "LEFT"
+def get_pan_command(error_x, previous_command):
+    return get_axis_command(
+        error=error_x,
+        previous_command=previous_command,
+        negative_command="LEFT",
+        positive_command="RIGHT",
+        deadzone=DEADZONE_X,
+        hysteresis=COMMAND_HYSTERESIS_X,
+    )
 
-    if error_x > DEADZONE_X:
-        return "RIGHT"
 
-    return "STOP"
+def get_tilt_command(error_y, previous_command):
+    return get_axis_command(
+        error=error_y,
+        previous_command=previous_command,
+        negative_command="UP",
+        positive_command="DOWN",
+        deadzone=DEADZONE_Y,
+        hysteresis=COMMAND_HYSTERESIS_Y,
+    )
 
 
-def get_tilt_command(error_y):
-    if error_y < -DEADZONE_Y:
-        return "UP"
+def get_axis_command(
+    error,
+    previous_command,
+    negative_command,
+    positive_command,
+    deadzone,
+    hysteresis,
+):
+    enter_threshold = deadzone + hysteresis
+    exit_threshold = max(0, deadzone - hysteresis)
 
-    if error_y > DEADZONE_Y:
-        return "DOWN"
+    if previous_command == negative_command and error < -exit_threshold:
+        return negative_command
+
+    if previous_command == positive_command and error > exit_threshold:
+        return positive_command
+
+    if error < -enter_threshold:
+        return negative_command
+
+    if error > enter_threshold:
+        return positive_command
 
     return "STOP"
 
@@ -352,49 +214,6 @@ def parse_args():
         default=0,
         help="OpenCV camera index.",
     )
-    parser.add_argument(
-        "--detector",
-        choices=("auto", "dnn", "yunet", "haar"),
-        default="dnn",
-        help="Face detector to use. Default is OpenCV DNN.",
-    )
-    parser.add_argument(
-        "--dnn-proto",
-        default=str(DEFAULT_DNN_PROTO),
-        help="Path to OpenCV DNN deploy.prototxt.",
-    )
-    parser.add_argument(
-        "--dnn-model",
-        default=str(DEFAULT_DNN_MODEL),
-        help="Path to OpenCV DNN Caffe model.",
-    )
-    parser.add_argument(
-        "--download-dnn",
-        action="store_true",
-        help="Download the OpenCV DNN face detector files if missing.",
-    )
-    parser.add_argument(
-        "--dnn-score",
-        type=float,
-        default=0.6,
-        help="OpenCV DNN confidence threshold. Lower detects more, higher is stricter.",
-    )
-    parser.add_argument(
-        "--yunet-model",
-        default=str(DEFAULT_YUNET_MODEL),
-        help="Path to OpenCV YuNet ONNX model.",
-    )
-    parser.add_argument(
-        "--download-yunet",
-        action="store_true",
-        help="Download the OpenCV YuNet model if it is missing.",
-    )
-    parser.add_argument(
-        "--yunet-score",
-        type=float,
-        default=0.75,
-        help="YuNet confidence threshold. Lower detects more, higher is stricter.",
-    )
     return parser.parse_args()
 
 
@@ -403,25 +222,30 @@ def main():
 
     camera = cv2.VideoCapture(args.camera)
 
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades
+        + "haarcascade_frontalface_default.xml"
+    )
+
     if not camera.isOpened():
         print("Could not open the camera.")
         print("Close other apps using it or try another camera index.")
         return
 
-    try:
-        face_detector = create_face_detector(args)
-    except RuntimeError as error:
-        print(error)
+    if face_cascade.empty():
+        print("Could not load the face detector.")
         camera.release()
         return
 
     esp32 = ESP32Client(args.esp32_ip, args.esp32_port)
+    smoother = ErrorSmoother(
+        alpha=SMOOTHING_ALPHA,
+        max_delta_x=MAX_ERROR_DELTA_X,
+        max_delta_y=MAX_ERROR_DELTA_Y,
+    )
 
-    print("Camera opened. Face detection is running.")
+    print("Camera opened. Haar face detection is running.")
     print("Press q in the video window to quit.")
-
-    smoothed_error_x = None
-    smoothed_error_y = None
 
     command_error_x = 0
     command_error_y = 0
@@ -440,13 +264,22 @@ def main():
             print("Could not read a frame from the camera.")
             break
 
-        faces = face_detector.detect(frame)
+        gray_frame = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2GRAY,
+        )
+
+        faces = face_cascade.detectMultiScale(
+            gray_frame,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(60, 60),
+        )
 
         frame_height, frame_width = frame.shape[:2]
         frame_center_x = frame_width // 2
         frame_center_y = frame_height // 2
 
-        # Draw the center of the frame.
         cv2.circle(
             frame,
             (frame_center_x, frame_center_y),
@@ -455,7 +288,6 @@ def main():
             -1,
         )
 
-        # Draw the deadzone.
         deadzone_top_left = (
             frame_center_x - DEADZONE_X,
             frame_center_y - DEADZONE_Y,
@@ -500,36 +332,29 @@ def main():
             error_x = face_center_x - frame_center_x
             error_y = face_center_y - frame_center_y
 
-            if smoothed_error_x is None:
-                smoothed_error_x = error_x
-                smoothed_error_y = error_y
-            else:
-                smoothed_error_x = (
-                    SMOOTHING_ALPHA * error_x
-                    + (1 - SMOOTHING_ALPHA)
-                    * smoothed_error_x
-                )
-
-                smoothed_error_y = (
-                    SMOOTHING_ALPHA * error_y
-                    + (1 - SMOOTHING_ALPHA)
-                    * smoothed_error_y
-                )
-
-            smoothed_error_x = round(smoothed_error_x)
-            smoothed_error_y = round(smoothed_error_y)
+            smoothed_error_x, smoothed_error_y = smoother.update(
+                error_x,
+                error_y,
+            )
 
             command_error_x = smoothed_error_x
             command_error_y = smoothed_error_y
 
             missed_frames = 0
 
-            pan_command = get_pan_command(smoothed_error_x)
-            tilt_command = get_tilt_command(smoothed_error_y)
+            pan_command = get_pan_command(
+                smoothed_error_x,
+                pan_command,
+            )
+            tilt_command = get_tilt_command(
+                smoothed_error_y,
+                tilt_command,
+            )
 
             error_text = (
-                f"Smoothed X: {smoothed_error_x}  "
-                f"Smoothed Y: {smoothed_error_y}"
+                f"Raw X: {error_x}  Raw Y: {error_y}  "
+                f"Smooth X: {smoothed_error_x}  "
+                f"Smooth Y: {smoothed_error_y}"
             )
 
             command_text = (
@@ -542,7 +367,7 @@ def main():
                 error_text,
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                0.55,
                 (0, 255, 0),
                 2,
             )
@@ -575,8 +400,7 @@ def main():
                 command_error_x = 0
                 command_error_y = 0
 
-                smoothed_error_x = None
-                smoothed_error_y = None
+                smoother.reset()
 
                 status_text = (
                     "No face - Pan: STOP  Tilt: STOP"
@@ -592,7 +416,6 @@ def main():
                 2,
             )
 
-        # Send the latest command to the ESP32 at 10 Hz.
         current_time = time.monotonic()
 
         if (
@@ -619,7 +442,7 @@ def main():
             sequence_number += 1
             last_command_time = current_time
 
-        cv2.imshow(f"Face Detection ({face_detector.name})", frame)
+        cv2.imshow("Face Detection", frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break

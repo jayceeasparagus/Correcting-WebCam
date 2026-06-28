@@ -5,7 +5,7 @@
  *   {"pan":"RIGHT","tilt":"UP","error_x":120,"error_y":-40}
  *
  * ESP32 forwards this compact UART command to STM32:
- *   PAN=RIGHT,TILT=UP
+ *   PAN=RIGHT,TILT=UP,EX=120,EY=-40
  */
 
 #include <Arduino.h>
@@ -37,6 +37,7 @@ static void handleIncomingCommand(const String& message, bool cameFromTcp);
 static void sendToStm32(const String& command);
 static String makeStm32Command(const String& message);
 static String extractJsonString(const String& json, const String& key);
+static long extractJsonInt(const String& json, const String& key, long fallback);
 static bool isDirection(const String& value);
 static void publishToTcp(const String& message);
 
@@ -56,7 +57,7 @@ void setup()
   Serial.print(WiFi.localIP());
   Serial.print(":");
   Serial.println(TCP_PORT);
-  Serial.println("Serial Monitor test commands: PING, LED_ON, LED_OFF, BLINK, PAN=RIGHT,TILT=UP");
+  Serial.println("Serial Monitor test commands: PING, CENTER, PAN=RIGHT,TILT=UP,EX=120,EY=-40");
 }
 
 void loop()
@@ -206,7 +207,7 @@ static void sendToStm32(const String& command)
 
 static String makeStm32Command(const String& message)
 {
-  if (message == "PING" || message == "LED_ON" || message == "LED_OFF" || message == "BLINK") {
+  if (message == "PING" || message == "CENTER") {
     return message;
   }
 
@@ -216,6 +217,8 @@ static String makeStm32Command(const String& message)
 
   String pan = extractJsonString(message, "pan");
   String tilt = extractJsonString(message, "tilt");
+  long errorX = extractJsonInt(message, "error_x", 0);
+  long errorY = extractJsonInt(message, "error_y", 0);
   pan.toUpperCase();
   tilt.toUpperCase();
 
@@ -223,7 +226,8 @@ static String makeStm32Command(const String& message)
     return "";
   }
 
-  return String("PAN=") + pan + ",TILT=" + tilt;
+  return String("PAN=") + pan + ",TILT=" + tilt +
+         ",EX=" + String(errorX) + ",EY=" + String(errorY);
 }
 
 static String extractJsonString(const String& json, const String& key)
@@ -250,6 +254,39 @@ static String extractJsonString(const String& json, const String& key)
   }
 
   return json.substring(firstQuote + 1, secondQuote);
+}
+
+static long extractJsonInt(const String& json, const String& key, long fallback)
+{
+  String pattern = String("\"") + key + "\"";
+  int keyIndex = json.indexOf(pattern);
+  if (keyIndex < 0) {
+    return fallback;
+  }
+
+  int colonIndex = json.indexOf(':', keyIndex + pattern.length());
+  if (colonIndex < 0) {
+    return fallback;
+  }
+
+  int valueStart = colonIndex + 1;
+  while (valueStart < (int)json.length() && json[valueStart] == ' ') {
+    valueStart++;
+  }
+
+  int valueEnd = valueStart;
+  while (
+    valueEnd < (int)json.length()
+    && (json[valueEnd] == '-' || isDigit(json[valueEnd]))
+  ) {
+    valueEnd++;
+  }
+
+  if (valueEnd == valueStart) {
+    return fallback;
+  }
+
+  return json.substring(valueStart, valueEnd).toInt();
 }
 
 static bool isDirection(const String& value)
