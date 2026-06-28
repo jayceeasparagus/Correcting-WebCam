@@ -2,6 +2,8 @@ import json
 import socket
 import time
 import argparse
+import urllib.request
+from pathlib import Path
 
 import cv2
 
@@ -16,6 +18,16 @@ ESP32_PORT = 5000
 
 # Send at 10 Hz instead of once per camera frame.
 COMMAND_INTERVAL_SECONDS = 0.1
+
+YUNET_MODEL_URL = (
+    "https://github.com/opencv/opencv_zoo/raw/main/models/"
+    "face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
+DEFAULT_YUNET_MODEL = (
+    Path(__file__).resolve().parent
+    / "models"
+    / "face_detection_yunet_2023mar.onnx"
+)
 
 
 class ESP32Client:
@@ -84,6 +96,112 @@ class ESP32Client:
                 print(f"ESP32: {line}")
 
 
+class HaarFaceDetector:
+    name = "haar"
+
+    def __init__(self):
+        self.classifier = cv2.CascadeClassifier(
+            cv2.data.haarcascades
+            + "haarcascade_frontalface_default.xml"
+        )
+
+        if self.classifier.empty():
+            raise RuntimeError("Could not load Haar face detector.")
+
+    def detect(self, frame):
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.classifier.detectMultiScale(
+            gray_frame,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(60, 60),
+        )
+        return [tuple(map(int, face)) for face in faces]
+
+
+class YuNetFaceDetector:
+    name = "yunet"
+
+    def __init__(self, model_path, score_threshold):
+        if not hasattr(cv2, "FaceDetectorYN_create"):
+            raise RuntimeError(
+                "This OpenCV install does not include FaceDetectorYN/YuNet."
+            )
+
+        self.detector = cv2.FaceDetectorYN_create(
+            str(model_path),
+            "",
+            (320, 320),
+            score_threshold,
+            0.3,
+            5000,
+        )
+        self.input_size = None
+
+    def detect(self, frame):
+        frame_height, frame_width = frame.shape[:2]
+        input_size = (frame_width, frame_height)
+
+        if self.input_size != input_size:
+            self.detector.setInputSize(input_size)
+            self.input_size = input_size
+
+        _, detections = self.detector.detect(frame)
+
+        if detections is None:
+            return []
+
+        faces = []
+
+        for detection in detections:
+            x, y, width, height = detection[:4]
+            faces.append(
+                (
+                    max(0, int(round(x))),
+                    max(0, int(round(y))),
+                    max(0, int(round(width))),
+                    max(0, int(round(height))),
+                )
+            )
+
+        return faces
+
+
+def download_yunet_model(model_path):
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading YuNet model to {model_path}")
+    urllib.request.urlretrieve(YUNET_MODEL_URL, model_path)
+
+
+def create_face_detector(args):
+    model_path = Path(args.yunet_model)
+
+    if args.download_yunet and not model_path.exists():
+        download_yunet_model(model_path)
+
+    if args.detector in ("auto", "yunet") and model_path.exists():
+        try:
+            detector = YuNetFaceDetector(
+                model_path=model_path,
+                score_threshold=args.yunet_score,
+            )
+            print(f"Using YuNet face detector: {model_path}")
+            return detector
+        except RuntimeError as error:
+            if args.detector == "yunet":
+                raise
+            print(f"YuNet unavailable, falling back to Haar: {error}")
+
+    if args.detector == "yunet":
+        raise RuntimeError(
+            f"YuNet model not found: {model_path}. "
+            "Run with --download-yunet or choose --detector haar."
+        )
+
+    print("Using Haar cascade face detector.")
+    return HaarFaceDetector()
+
+
 def get_face_area(face):
     x, y, width, height = face
     return width * height
@@ -130,6 +248,28 @@ def parse_args():
         default=0,
         help="OpenCV camera index.",
     )
+    parser.add_argument(
+        "--detector",
+        choices=("auto", "yunet", "haar"),
+        default="auto",
+        help="Face detector to use. Auto prefers YuNet if the model exists.",
+    )
+    parser.add_argument(
+        "--yunet-model",
+        default=str(DEFAULT_YUNET_MODEL),
+        help="Path to OpenCV YuNet ONNX model.",
+    )
+    parser.add_argument(
+        "--download-yunet",
+        action="store_true",
+        help="Download the OpenCV YuNet model if it is missing.",
+    )
+    parser.add_argument(
+        "--yunet-score",
+        type=float,
+        default=0.75,
+        help="YuNet confidence threshold. Lower detects more, higher is stricter.",
+    )
     return parser.parse_args()
 
 
@@ -138,18 +278,15 @@ def main():
 
     camera = cv2.VideoCapture(args.camera)
 
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades
-        + "haarcascade_frontalface_default.xml"
-    )
-
     if not camera.isOpened():
         print("Could not open the camera.")
         print("Close other apps using it or try another camera index.")
         return
 
-    if face_cascade.empty():
-        print("Could not load the face detector.")
+    try:
+        face_detector = create_face_detector(args)
+    except RuntimeError as error:
+        print(error)
         camera.release()
         return
 
@@ -178,17 +315,7 @@ def main():
             print("Could not read a frame from the camera.")
             break
 
-        gray_frame = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2GRAY,
-        )
-
-        faces = face_cascade.detectMultiScale(
-            gray_frame,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(60, 60),
-        )
+        faces = face_detector.detect(frame)
 
         frame_height, frame_width = frame.shape[:2]
         frame_center_x = frame_width // 2
@@ -367,7 +494,7 @@ def main():
             sequence_number += 1
             last_command_time = current_time
 
-        cv2.imshow("Face Detection", frame)
+        cv2.imshow(f"Face Detection ({face_detector.name})", frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
