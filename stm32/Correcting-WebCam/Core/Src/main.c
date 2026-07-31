@@ -23,14 +23,24 @@
 #define TILT_Pin GPIO_PIN_7
 #define TILT_GPIO_Port GPIOA
 
-/* Tune these first. Error-scaled movement is:
- *   step = SERVO_MIN_STEP_US + abs(error) * SERVO_GAIN_NUM / SERVO_GAIN_DEN
- * then clamped to SERVO_MAX_STEP_US.
+/* Outer-loop visual PID gains. The controller output is the maximum pulse-width
+ * change, in microseconds, applied for each new camera measurement (10 Hz).
+ * Start by tuning KP, then add a small KD, and only then increase KI.
  */
-#define SERVO_MIN_STEP_US 8U
-#define SERVO_MAX_STEP_US 45U
-#define SERVO_GAIN_NUM 1U
-#define SERVO_GAIN_DEN 6U
+#define PAN_PID_KP 0.18f
+#define PAN_PID_KI 0.025f
+#define PAN_PID_KD 0.010f
+
+#define TILT_PID_KP 0.16f
+#define TILT_PID_KI 0.020f
+#define TILT_PID_KD 0.008f
+
+#define PID_OUTPUT_LIMIT_US 35.0f
+#define PID_INTEGRAL_LIMIT 600.0f
+#define PID_DERIVATIVE_ALPHA 0.25f
+#define PID_DEFAULT_DT_S 0.10f
+#define PID_MIN_DT_S 0.02f
+#define PID_MAX_DT_S 0.25f
 
 #define PAN_MIN_US 800U
 #define PAN_CENTER_US 1500U
@@ -83,6 +93,17 @@ typedef struct
   int16_t error_y;
 } ServoCommand;
 
+typedef struct
+{
+  float kp;
+  float ki;
+  float kd;
+  float integral;
+  float previous_error;
+  float filtered_derivative;
+  uint8_t initialized;
+} PidController;
+
 UART_HandleTypeDef huart1;
 
 static QueueHandle_t commandQueue;
@@ -107,9 +128,13 @@ static int16_t ParseIntField(const char *line, const char *key);
 static void ProcessCommand(const CommandMessage *message);
 static void QueueServoCommand(CommandType type, Direction pan, Direction tilt, int16_t error_x, int16_t error_y);
 
-static void Servo_ApplyCommand(const ServoCommand *command, uint16_t *pan_us, uint16_t *tilt_us);
-static uint16_t ErrorToStepUs(int16_t error);
-static uint16_t AbsI16(int16_t value);
+static void Servo_ApplyCommand(const ServoCommand *command, uint16_t *pan_us, uint16_t *tilt_us,
+                               PidController *pan_pid, PidController *tilt_pid, float dt_s);
+static void Pid_Init(PidController *pid, float kp, float ki, float kd);
+static void Pid_Reset(PidController *pid);
+static float Pid_Update(PidController *pid, float error, float dt_s);
+static float ClampFloat(float value, float minimum, float maximum);
+static int32_t RoundFloat(float value);
 static uint16_t ClampPulse(int32_t pulse, uint16_t min_us, uint16_t max_us);
 static void Servo_WriteFrame(uint16_t pan_us, uint16_t tilt_us);
 static void Delay_Us(uint32_t microseconds);
@@ -158,7 +183,7 @@ int main(void)
     Error_Handler();
   }
 
-  UART_SendText("\r\nSTM32 FreeRTOS servo controller ready.\r\n");
+  UART_SendText("\r\nSTM32 FreeRTOS PID servo controller ready.\r\n");
   vTaskStartScheduler();
 
   Error_Handler();
@@ -310,14 +335,31 @@ static void ServoTask(void *argument)
 
   uint16_t pan_us = PAN_CENTER_US;
   uint16_t tilt_us = TILT_CENTER_US;
+  PidController pan_pid;
+  PidController tilt_pid;
   ServoCommand command;
   TickType_t lastWake = xTaskGetTickCount();
+  TickType_t lastControlTick = lastWake;
+
+  Pid_Init(&pan_pid, PAN_PID_KP, PAN_PID_KI, PAN_PID_KD);
+  Pid_Init(&tilt_pid, TILT_PID_KP, TILT_PID_KI, TILT_PID_KD);
 
   for (;;)
   {
     while (xQueueReceive(servoQueue, &command, 0U) == pdPASS)
     {
-      Servo_ApplyCommand(&command, &pan_us, &tilt_us);
+      TickType_t now = xTaskGetTickCount();
+      TickType_t elapsedTicks = now - lastControlTick;
+      float dt_s = PID_DEFAULT_DT_S;
+
+      if (elapsedTicks > 0U)
+      {
+        dt_s = (float)elapsedTicks / (float)configTICK_RATE_HZ;
+      }
+      dt_s = ClampFloat(dt_s, PID_MIN_DT_S, PID_MAX_DT_S);
+
+      Servo_ApplyCommand(&command, &pan_us, &tilt_us, &pan_pid, &tilt_pid, dt_s);
+      lastControlTick = now;
     }
 
     Servo_WriteFrame(pan_us, tilt_us);
@@ -485,63 +527,132 @@ static void QueueServoCommand(CommandType type, Direction pan, Direction tilt, i
   (void)xQueueSend(servoQueue, &command, 0U);
 }
 
-static void Servo_ApplyCommand(const ServoCommand *command, uint16_t *pan_us, uint16_t *tilt_us)
+static void Servo_ApplyCommand(const ServoCommand *command, uint16_t *pan_us, uint16_t *tilt_us,
+                               PidController *pan_pid, PidController *tilt_pid, float dt_s)
 {
   if (command->type == COMMAND_CENTER)
   {
     *pan_us = PAN_CENTER_US;
     *tilt_us = TILT_CENTER_US;
+    Pid_Reset(pan_pid);
+    Pid_Reset(tilt_pid);
     return;
   }
 
   if ((command->type == COMMAND_STOP) || (command->type == COMMAND_TIMEOUT_STOP))
   {
+    Pid_Reset(pan_pid);
+    Pid_Reset(tilt_pid);
     return;
   }
 
-  uint16_t pan_step_us = ErrorToStepUs(command->error_x);
-  uint16_t tilt_step_us = ErrorToStepUs(command->error_y);
+  if (command->pan == DIR_STOP)
+  {
+    Pid_Reset(pan_pid);
+  }
+  else
+  {
+    float pan_output_us = Pid_Update(pan_pid, (float)command->error_x, dt_s);
 
-  if (command->pan == DIR_LEFT)
-  {
-    *pan_us = ClampPulse((int32_t)*pan_us + (int32_t)pan_step_us, PAN_MIN_US, PAN_MAX_US);
-  }
-  else if (command->pan == DIR_RIGHT)
-  {
-    *pan_us = ClampPulse((int32_t)*pan_us - (int32_t)pan_step_us, PAN_MIN_US, PAN_MAX_US);
+    /* Positive image X error means the target is right of center. This mount's
+     * calibrated pulse direction is inverted, so subtract the PID output.
+     */
+    *pan_us = ClampPulse((int32_t)*pan_us - RoundFloat(pan_output_us),
+                         PAN_MIN_US, PAN_MAX_US);
   }
 
-  if (command->tilt == DIR_UP)
+  if (command->tilt == DIR_STOP)
   {
-    *tilt_us = ClampPulse((int32_t)*tilt_us + (int32_t)tilt_step_us, TILT_MIN_US, TILT_MAX_US);
+    Pid_Reset(tilt_pid);
   }
-  else if (command->tilt == DIR_DOWN)
+  else
   {
-    *tilt_us = ClampPulse((int32_t)*tilt_us - (int32_t)tilt_step_us, TILT_MIN_US, TILT_MAX_US);
+    float tilt_output_us = Pid_Update(tilt_pid, (float)command->error_y, dt_s);
+
+    *tilt_us = ClampPulse((int32_t)*tilt_us - RoundFloat(tilt_output_us),
+                          TILT_MIN_US, TILT_MAX_US);
   }
 }
 
-static uint16_t ErrorToStepUs(int16_t error)
+static void Pid_Init(PidController *pid, float kp, float ki, float kd)
 {
-  uint32_t magnitude = (uint32_t)AbsI16(error);
-  uint32_t step = SERVO_MIN_STEP_US + ((magnitude * SERVO_GAIN_NUM) / SERVO_GAIN_DEN);
-
-  if (step > SERVO_MAX_STEP_US)
-  {
-    return SERVO_MAX_STEP_US;
-  }
-
-  return (uint16_t)step;
+  pid->kp = kp;
+  pid->ki = ki;
+  pid->kd = kd;
+  Pid_Reset(pid);
 }
 
-static uint16_t AbsI16(int16_t value)
+static void Pid_Reset(PidController *pid)
 {
-  if (value < 0)
+  pid->integral = 0.0f;
+  pid->previous_error = 0.0f;
+  pid->filtered_derivative = 0.0f;
+  pid->initialized = 0U;
+}
+
+static float Pid_Update(PidController *pid, float error, float dt_s)
+{
+  float derivative = 0.0f;
+
+  if (pid->initialized != 0U)
   {
-    return (uint16_t)(-(int32_t)value);
+    derivative = (error - pid->previous_error) / dt_s;
+  }
+  else
+  {
+    pid->initialized = 1U;
   }
 
-  return (uint16_t)value;
+  pid->filtered_derivative += PID_DERIVATIVE_ALPHA
+                              * (derivative - pid->filtered_derivative);
+
+  float candidateIntegral = ClampFloat(pid->integral + (error * dt_s),
+                                       -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT);
+  float candidateOutput = (pid->kp * error)
+                          + (pid->ki * candidateIntegral)
+                          + (pid->kd * pid->filtered_derivative);
+  float limitedOutput = ClampFloat(candidateOutput,
+                                   -PID_OUTPUT_LIMIT_US, PID_OUTPUT_LIMIT_US);
+
+  /* Conditional integration prevents windup while an output limit is pushing
+   * in the same direction as the current error.
+   */
+  if ((candidateOutput == limitedOutput)
+      || ((candidateOutput > PID_OUTPUT_LIMIT_US) && (error < 0.0f))
+      || ((candidateOutput < -PID_OUTPUT_LIMIT_US) && (error > 0.0f)))
+  {
+    pid->integral = candidateIntegral;
+  }
+
+  pid->previous_error = error;
+
+  return ClampFloat((pid->kp * error)
+                    + (pid->ki * pid->integral)
+                    + (pid->kd * pid->filtered_derivative),
+                    -PID_OUTPUT_LIMIT_US, PID_OUTPUT_LIMIT_US);
+}
+
+static float ClampFloat(float value, float minimum, float maximum)
+{
+  if (value < minimum)
+  {
+    return minimum;
+  }
+  if (value > maximum)
+  {
+    return maximum;
+  }
+  return value;
+}
+
+static int32_t RoundFloat(float value)
+{
+  if (value >= 0.0f)
+  {
+    return (int32_t)(value + 0.5f);
+  }
+
+  return (int32_t)(value - 0.5f);
 }
 
 static uint16_t ClampPulse(int32_t pulse, uint16_t min_us, uint16_t max_us)
